@@ -1,46 +1,78 @@
-## Multistage build: First stage fetches dependencies
-FROM alpine:3.23 AS fetcher
+# syntax=docker/dockerfile:1.7
 
-# install and copy ca-certificates, mailcap, and tini-static; download JSON.sh
-RUN apk update && \
-    apk --no-cache add ca-certificates mailcap tini-static && \
-    wget -O /JSON.sh https://raw.githubusercontent.com/dominictarr/JSON.sh/0d5e5c77365f63809bf6e77ef44a1f34b0e05840/JSON.sh
+FROM node:24-alpine AS frontend-builder
 
-## Second stage: Use lightweight BusyBox image for final runtime environment
+WORKDIR /src/frontend
+
+RUN corepack enable
+
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN --mount=type=cache,id=pnpm,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+
+COPY frontend/ ./
+RUN pnpm run build
+
+
+FROM golang:1.25-alpine AS backend-builder
+
+WORKDIR /src
+
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    go mod download
+
+COPY . ./
+COPY --from=frontend-builder /src/frontend/dist/ ./frontend/dist/
+
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
+    go build -trimpath \
+      -ldflags="-s -w -X github.com/filebrowser/filebrowser/v2/version.Version=${VERSION} -X github.com/filebrowser/filebrowser/v2/version.CommitSHA=${COMMIT}" \
+      -o /out/filebrowser .
+
+
+FROM alpine:3.23 AS runtime-assets
+
+RUN apk add --no-cache ca-certificates mailcap tini-static && \
+    wget -O /JSON.sh \
+      https://raw.githubusercontent.com/dominictarr/JSON.sh/0d5e5c77365f63809bf6e77ef44a1f34b0e05840/JSON.sh
+
+
 FROM busybox:1.37.0-musl
 
-# Define non-root user UID and GID
-ENV UID=1000
-ENV GID=1000
+ENV UID=1000 \
+    GID=1000
 
-# Create user group and user
-RUN addgroup -g $GID user && \
-    adduser -D -u $UID -G user user
+RUN addgroup -g "$GID" user && \
+    adduser -D -u "$UID" -G user user && \
+    mkdir -p /config /database /srv && \
+    chown -R user:user /config /database /srv
 
-# Copy binary, scripts, and configurations into image with proper ownership
-COPY --chown=user:user filebrowser /bin/filebrowser
+COPY --from=backend-builder --chown=user:user /out/filebrowser /bin/filebrowser
 COPY --chown=user:user docker/common/ /
 COPY --chown=user:user docker/alpine/ /
-COPY --chown=user:user --from=fetcher /sbin/tini-static /bin/tini
-COPY --from=fetcher /JSON.sh /JSON.sh
-COPY --from=fetcher /etc/ca-certificates.conf /etc/ca-certificates.conf
-COPY --from=fetcher /etc/ca-certificates /etc/ca-certificates
-COPY --from=fetcher /etc/mime.types /etc/mime.types
-COPY --from=fetcher /etc/ssl /etc/ssl
+COPY --from=runtime-assets /sbin/tini-static /bin/tini
+COPY --from=runtime-assets /JSON.sh /JSON.sh
+COPY --from=runtime-assets /etc/ca-certificates.conf /etc/ca-certificates.conf
+COPY --from=runtime-assets /etc/ca-certificates /etc/ca-certificates
+COPY --from=runtime-assets /etc/mime.types /etc/mime.types
+COPY --from=runtime-assets /etc/ssl /etc/ssl
 
-# Create data directories, set ownership, and ensure healthcheck script is executable
-RUN mkdir -p /config /database /srv && \
-    chown -R user:user /config /database /srv \
-    && chmod +x /healthcheck.sh
+RUN chmod +x /init.sh /healthcheck.sh /JSON.sh
 
-# Define healthcheck script
-HEALTHCHECK --start-period=2s --interval=5s --timeout=3s CMD /healthcheck.sh
+HEALTHCHECK --start-period=2s --interval=5s --timeout=3s CMD ["/healthcheck.sh"]
 
-# Set the user, volumes and exposed ports
 USER user
 
-VOLUME /srv /config /database
+VOLUME ["/srv", "/config", "/database"]
 
 EXPOSE 80
 
-ENTRYPOINT [ "tini", "--", "/init.sh" ]
+ENTRYPOINT ["/bin/tini", "--", "/init.sh"]
